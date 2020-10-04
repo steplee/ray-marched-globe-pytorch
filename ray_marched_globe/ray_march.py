@@ -19,21 +19,33 @@ def lookAt(eye, center, up0):
 
 class RayMarchingViz():
     def __init__(self, cfg):
-        #cfg.setdefault('resolution', 512//1)
-        cfg.setdefault('resolution', 756)
+        #cfg.setdefault('resolution1', 512//1)
+        cfg.setdefault('resolution1', 128+64)
+        cfg.setdefault('upsample', 4) # Allows less ray marching and trig,
+                                      # more texturing. However, it will leave a seam.
+                                      # Fixing the seam would require interpolating in object space
+                                      # instead of screen space.
         cfg.setdefault('fov', np.pi/3)
-        cfg.setdefault('iters', 18)
-        self.eye = torch.FloatTensor([-3,0,0]).cuda()
-        self.R = torch.eye(3).flip(0).cuda()
+        cfg.setdefault('iters', 16)
+        cfg.setdefault('pow', 16) # Lighting fall-off
+        cfg.setdefault('end', 90) # Max depth before set to zero
         self.iters = cfg['iters']
-        self.w = cfg['resolution']
-        self.h = cfg['resolution']
+        self.w = cfg['resolution1']
+        self.h = cfg['resolution1']
+        self.upsample = cfg['upsample']
         self.u = np.tan(cfg['fov']/2)
         self.v = np.tan(cfg['fov']/2)
+        self.pow = cfg['pow']
+        self.end = cfg['end']
         self.t0 = time.time()
 
+        self.eye = torch.FloatTensor([-3,0,0]).cuda()
+        self.R = torch.eye(3).flip(0).cuda()
+        self.centerOffset = np.zeros(3)
+
         #self.axes = torch.FloatTensor([[1,1,1.597]]).cuda()
-        self.axes = torch.FloatTensor([[1,1,1.001]]).cuda()
+        z_scale = 6378137.0/6356752.314245179
+        self.axes = torch.FloatTensor([[1,1,1*z_scale]]).cuda()
 
         self.worldImg = torch.from_numpy(cv2.imread('./res/world.wm.jpg'))\
                 .cuda().float().div_(255)
@@ -59,15 +71,19 @@ class RayMarchingViz():
         )[:3,:3].astype(np.float32)).cuda().T
         print(' - at',self.eye)
         print(' - R:\n',self.R)
-    def updateWithControls(self, dx,dy,dz,shift):
-        speed = (.01 + .05*abs(self.llh[-1]))
+    def updateWithControls(self, dx,dy,dz,shift,space):
+        speed = (.005 + .05*abs(1-self.llh[-1]))
         d = np.array((dx,dy,dz),dtype=np.float64) * speed
-        self.llh += d
-        lng,lat,alt = self.llh
-        self.eye = torch.FloatTensor([np.cos(lat)*np.cos(lng), np.cos(lat)*np.sin(lng), np.sin(lat)]).cuda() * alt
+        if space:
+            self.centerOffset += d
+        else:
+            self.llh += d
+            lng,lat,alt = self.llh
+            self.eye = torch.FloatTensor(
+                        [np.cos(lat)*np.cos(lng), np.cos(lat)*np.sin(lng), np.sin(lat)]).cuda() * alt
         self.R = torch.from_numpy(lookAt(
             self.eye.cpu().numpy(),
-            np.zeros(3),
+            self.R.cpu().numpy() @ self.centerOffset,
             np.array((0,0,1))
         )[:3,:3].astype(np.float32)).cuda().T
 
@@ -93,10 +109,10 @@ class RayMarchingViz():
             for ii in range(self.iters):
                 #rays = (uvws * depths) @ self.R.T
                 rays = rays_ * depths
-                dists = self.iso(self.eye, rays).view(-1,1).clamp_(-100,100)
+                dists = self.iso(self.eye, rays).view(-1,1).clamp_(-30,30)
                 depths = depths.add_(dists)
 
-            depths.masked_fill_(abs(depths)>14, 0)
+            depths.masked_fill_(abs(depths)>self.end, 0)
 
             pts = self.eye + rays_ * depths
 
@@ -113,18 +129,28 @@ class RayMarchingViz():
                 #screen_normal_z = torch.sqrt(1 - (screen_normal_xy**2).sum(-1))
                 screen_normal_z = 1. - torch.sqrt((screen_normal_xy**2).sum(-1))
                 d = screen_normal_z.clamp(0,1).unsqueeze_(-1)
-                d = (d).pow_(16)
+                d = (d).pow_(self.pow)
                 d.masked_fill_(depths.view(self.h,self.w,1)==0, 0)
 
             #c = self.eye + rays_*depths
             #c = c.view(self.h,self.w,3).mul_(20).cos_().sqrt_()
             c = ecef_to_geodetic(pts)
+            c = geodetic_to_unit_wm(c)
             if BILINEAR_TEXTURE:
+                c = c.view(1,self.h,self.w,2)
+                if self.upsample > 1:
+                    m = 'bilinear'
+                    d = F.upsample(d.permute(2,0,1).unsqueeze_(0), scale_factor=self.upsample,mode=m)[0].permute(1,2,0)
+                    c = F.upsample(c.permute(0,3,1,2), scale_factor=self.upsample,mode=m).permute(0,2,3,1)
                 c = F.grid_sample(
                         self.worldImg,
-                        ((geodetic_to_unit_wm(c).view(self.h,self.w,2).unsqueeze_(0))))[0].permute(1,2,0)
+                        c,
+                        mode='bilinear',
+                        #padding_mode='reflection',
+                        align_corners=True,
+                        )[0].permute(1,2,0)
             else:
-                c = ((geodetic_to_unit_wm(c) * .5 + .5) * self.worldImg.size(0)).clamp(0,self.worldImg.size(0)-1).long()
+                c = ((c * .5 + .5) * self.worldImg.size(0)).clamp(0,self.worldImg.size(0)-1).long()
                 c = self.worldImg[c[:,1], c[:,0]].view(self.h,self.w,-1)
 
             color = c * d
@@ -139,8 +165,8 @@ class RayMarchingViz():
     def iso(self, t, pts):
         pts_ = t + pts
         #return (pts_).norm(dim=1) - (1+self.noise(pts_)/2)
-        #return (pts_.mul_(self.axes)).norm(dim=1).sub_(1)
-        return (pts_.mul_(self.axes)).norm(dim=1).sub_(1 + self.hills(pts_))
+        return (pts_.mul_(self.axes)).norm(dim=1).sub_(1)
+        #return (pts_.mul_(self.axes)).norm(dim=1).sub_(1 + self.hills(pts_))
 
     def hills(self, x):
         x = x / x.norm(dim=1,keepdim=True)
@@ -186,28 +212,31 @@ class RayMarchingViz():
 if __name__ == '__main__':
     rmv = RayMarchingViz({})
 
-    dx, dy, dz, shift = 0, 0, 0, False
+    dx, dy, dz, shift, space = 0, 0, 0, False, False
     do_exit = False
     last = (0,)*3
     if LIVE_CONTROLS:
         from pynput import mouse, keyboard
         def on_move(x,y):
-            global last, dx, dy
-            if last[0] != 0 and last[1] != 0:
+            global last, dx, dy, shift
+            if (not shift) and last[0] != 0 and last[1] != 0:
                 dx += (x - last[0]) * .01
                 dy += (y - last[1]) * .01
             last = (x,y,last[-1])
         def on_scroll(x,y,dx_,dy_):
             global dz
-            dz += dy_ * .01
+            dz += dy_ * .08
         def on_press(key):
-            global do_exit
+            global do_exit, shift, space
             if hasattr(key,'char'):
                 if key.char == 'q':
                     do_exit = True
-            elif key.value == 'shift': shift=True
+            elif key.name == 'shift': shift=True
+            elif key.name == 'space': space=True
         def on_release(key):
-            if hasattr(key, 'value') and key.value == 'shift': shift=False
+            global shift, space
+            if hasattr(key, 'name') and key.name == 'shift': shift=False
+            if hasattr(key, 'space') and key.name == 'space': space=False
         listener = mouse.Listener(on_move=on_move,on_scroll=on_scroll)
         listener.start()
         listener2 = keyboard.Listener(on_press=on_press,on_release=on_release)
@@ -218,7 +247,7 @@ if __name__ == '__main__':
 
     for i in range(10000):
         #rmv.update(dx,dy,shift)
-        rmv.updateWithControls(dx,dy,dz,shift)
+        rmv.updateWithControls(dx,dy,dz,shift,space)
         #dx=dy=dz=0
         dx = dx * .9
         dy = dy * .9
